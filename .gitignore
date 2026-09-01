@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+macapp/NoteSyncBar
+macapp/NoteSyncBar.app/
+config.json
+.DS_Store

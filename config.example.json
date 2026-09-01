@@ -1,0 +1,19 @@
+{
+  "store": "iCloud Drive/SYNC",
+  "state": "~/Documents/NoteSync",
+  "engine_dir": "~/notesync",
+  "poll_apple_seconds": 120,
+  "poll_evernote_seconds": 300,
+  "gdrive_mirror": null,
+  "gdrive_enabled": false,
+  "mappings": [
+    {
+      "name": "sync",
+      "folder": "",
+      "apple_folder": "SYNC",
+      "apple_enabled": true,
+      "en_notebook": "SYNC",
+      "en_enabled": true
+    }
+  ]
+}
