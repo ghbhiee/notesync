@@ -38,7 +38,7 @@ cp -R NoteSyncBar.app /Applications/ && open /Applications/NoteSyncBar.app
 | md | Evernote | Apple Notes |
 |---|---|---|
 | `#` `##` | h1/h2 | 渲染（Apple 存为 b+24/18px span，拍平可逆） |
-| `###` | h3 | 字面（Apple 退化为 b，会与加粗混淆） |
+| `###` | h3 | 渲染（18px+斜体编码——`<h3>` 会退化为 b、<18px 字号被剥，此编码可逆） |
 | `**粗**` `*斜*` | 渲染 | 渲染 |
 | `- 列表` | ul | ul |
 | `1.` `[链接]()` `- [ ]` | 字面 | 字面（Apple 丢 ol 类型/丢 href） |

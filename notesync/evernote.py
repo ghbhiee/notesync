@@ -144,9 +144,15 @@ class _Flattener(HTMLParser):
             if m and m.group(1) in _APPLE_H and not self.prefix:
                 cur = self.lines[-1]
                 if cur == "" or (self.fmt and cur == "".join(self.fmt)):
+                    # 18px alone is h2; 18px opened together with <i> is our
+                    # h3 encoding (Apple strips any size smaller than 18px)
+                    italic = "*" in self.fmt
                     self.lines[-1] = ""
                     self.fmt.clear()
-                    self.prefix = [_APPLE_H[m.group(1)]]
+                    p = _APPLE_H[m.group(1)]
+                    if m.group(1) == "18px" and italic:
+                        p = "### "
+                    self.prefix = [p]
         elif tag in ("b", "strong"):
             if self._in_heading() or (self.table and self.table["row"] == 0):
                 return  # heading lines / table headers are implicitly bold

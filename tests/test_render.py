@@ -10,6 +10,8 @@ DOC = '<!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd">'
 
 CASES = [
     "# 标题\n\n正文\n",
+    "### 三级\n正文\n",
+    "## 二级\n### 三级 **粗**\n\n段落\n",
     "## 二级\n**加粗** 与 *斜体* 混排\n",
     "- a\n- b\n\n尾行\n",
     "列表前\n- item **粗** 中\n- 二\n列表后\n",
@@ -23,7 +25,6 @@ CASES = [
     "",
 ]
 EN_ONLY = [
-    "### 三级\n",
     "[链接](https://x.y/path)\n",
     "文中 [a](https://a.b) 与 **粗** 并存\n",
 ]
@@ -46,9 +47,16 @@ class TestAppleFixedPoint(unittest.TestCase):
         for md in CASES:
             self.assertEqual(self.rt(md), md, f"Apple not a fixed point: {md!r}")
 
-    def test_h3_and_links_stay_literal(self):
-        for md in ["### 三级\n", "[链接](https://x.y)\n"]:
-            self.assertEqual(self.rt(md), md)
+    def test_links_stay_literal(self):
+        self.assertEqual(self.rt("[链接](https://x.y)\n"), "[链接](https://x.y)\n")
+
+    def test_apple_rewritten_h3_form(self):
+        # Apple fragments our b+i+18px encoding; must still flatten to ###
+        raw = ('<div><b><i><span style="font-size: 18px">三级</span></i></b>'
+               '<b><i><span style="font-size: 18px">标题</span></i></b>'
+               '<b><i><span style="font-size: 18px"><br></span></i></b></div>\n'
+               '<div>正文<br></div>\n')
+        self.assertEqual(html_to_md(raw), "### 三级标题\n正文\n")
 
     def test_apple_rewritten_heading_form(self):
         # what Apple actually stores after we write <h1>/<h2>

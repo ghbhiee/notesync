@@ -23,10 +23,16 @@ class Profile:
         self.link = link
         self.blank = blank
 
-ENML_PROFILE = Profile({"# ": "h1", "## ": "h2", "### ": "h3"},
-                       link=True, blank="<div><br/></div>")
-APPLE_PROFILE = Profile({"# ": "h1", "## ": "h2"},
-                        link=False, blank="<div><br></div>")
+ENML_PROFILE = Profile(
+    {"# ": ("<h1>", "</h1>"), "## ": ("<h2>", "</h2>"), "### ": ("<h3>", "</h3>")},
+    link=True, blank="<div><br/></div>")
+# Apple: <h3> degrades to bare <b> (ambiguous with bold), and font sizes below
+# 18px are stripped -- so h3 is rendered as heading-2 size + italic, a
+# combination Apple preserves and the flattener can invert uniquely.
+APPLE_PROFILE = Profile(
+    {"# ": ("<h1>", "</h1>"), "## ": ("<h2>", "</h2>"),
+     "### ": ('<b><i><span style="font-size: 18px">', "</span></i></b>")},
+    link=False, blank="<div><br></div>")
 
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 _ITAL = re.compile(r"(?<!\*)\*(?!\s)([^*]+?)(?<!\s)\*(?!\*)")
@@ -133,8 +139,10 @@ def render(md, profile):
         head = next((p for p in profile.headings if ln.startswith(p)), None)
         if head:
             close_ul()
-            tag = profile.headings[head]
-            out.append(f"<{tag}>{_inline(ln[len(head):], profile)}</{tag}>")
+            op, cl = profile.headings[head]
+            # heading text stays literal: endpoints bold whole headings
+            # implicitly, so inline markers there cannot round-trip
+            out.append(f"{op}{_esc(ln[len(head):])}{cl}")
             continue
         if ln.startswith("- ") and not ln.startswith(("- [ ]", "- [x]")):
             if not in_ul:
