@@ -67,3 +67,44 @@ class TestAppleFixedPoint(unittest.TestCase):
         raw = ('<ul>\n<li><font face=".PingFang">一</font><br></li>\n'
                '<li><font face=".PingFang">二</font><br></li>\n</ul>\n')
         self.assertEqual(html_to_md(raw), "- 一\n- 二\n")
+
+
+TABLE_CASES = [
+    "| a | b |\n|---|---|\n| 1 | 2 |\n",
+    "前文\n| 元素 | 状态 |\n|---|---|\n| 标题 **粗** | 渲染 |\n| 空 |  |\n后文\n",
+    "| 单列 |\n|---|\n",                       # header-only table
+    "| a | b |\n|---|---|\n非表格行\n",         # table then plain line
+]
+TABLE_LITERAL = [
+    "| a | b |\n|:--|--:|\n| 1 | 2 |\n",       # alignment colons: literal
+    "|a|b|\n|---|---|\n",                       # non-canonical spacing: literal
+    "| a | b |\n没有分隔行\n",                   # no separator: literal
+]
+
+
+class TestTableFixedPoint(unittest.TestCase):
+    def rt_en(self, md):
+        from notesync.render import ENML_PROFILE, render
+        return enml_to_md(f"{DOC}<en-note>{render(md, ENML_PROFILE)}</en-note>")
+
+    def rt_apple(self, md):
+        from notesync.render import APPLE_PROFILE, render
+        return html_to_md(render(md, APPLE_PROFILE))
+
+    def test_tables_fixed_point(self):
+        for md in TABLE_CASES + TABLE_LITERAL:
+            self.assertEqual(self.rt_en(md), md, f"EN: {md!r}")
+            self.assertEqual(self.rt_apple(md), md, f"Apple: {md!r}")
+
+    def test_apple_rewritten_table_form(self):
+        # what Apple actually stores after we write a <table> (captured live)
+        raw = ('<div>标题行</div>\n'
+               '<div><object><table cellspacing="0" style="x">\n<tbody>\n'
+               '<tr><td valign="top" style="y"><div><b><font face=".P-Bold">元素</font></b></div>\n</td>'
+               '<td valign="top"><div><b><font face=".P-Bold">状态</font></b></div>\n</td></tr>\n'
+               '<tr><td><div><font face=".P">标题</font></div>\n</td>'
+               '<td><div><font face=".P">渲染</font></div>\n</td></tr>\n'
+               '</tbody>\n</table></object><br></div>\n'
+               '<div>表后行<br></div>\n')
+        self.assertEqual(html_to_md(raw),
+                         "标题行\n| 元素 | 状态 |\n|---|---|\n| 标题 | 渲染 |\n表后行\n")

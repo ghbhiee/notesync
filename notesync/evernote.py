@@ -51,6 +51,8 @@ class _Flattener(HTMLParser):
         self.prefix = []          # pending line prefix (list bullet, heading)
         self.fmt = []             # open inline markers to close
         self.href = None
+        self.table = None         # {"row": n, "cells": n} while inside a table
+        self.swallow_br = False   # eat the <br> Apple appends after </table>
 
     def _in_heading(self):
         cur = "".join(self.prefix) or self.lines[-1]
@@ -75,7 +77,62 @@ class _Flattener(HTMLParser):
             self.prefix = []
         self.lines[-1] += text
 
+    # -- tables ----------------------------------------------------------
+    # Rebuilt as canonical pipe rows ("| a | b |") with a "|---|" separator
+    # after the first row -- exactly the form render._try_table accepts, so
+    # table round-trips are fixed points. Inside a table, wrapper tags
+    # (Apple nests <object><table><tbody> and puts <div><font> in cells)
+    # must not break lines, and Apple force-bolds header cells, so inline
+    # markers are suppressed on row 0.
+    def _table_start(self, tag):
+        if tag == "table":
+            self._flush_block()
+            self.table = {"row": 0, "cells": 0}
+            return True
+        if self.table is None:
+            return False
+        if tag == "tr":
+            self._flush_block()
+            self.lines[-1] = "|"
+            self.table["cells"] = 0
+            return True
+        if tag in ("td", "th"):
+            self.lines[-1] += " "
+            return True
+        if tag in ("tbody", "thead", "object", "div", "p", "br", "span",
+                   "font", "colgroup", "col"):
+            return True  # wrappers inside a table: swallow
+        return False
+
+    def _table_end(self, tag):
+        if self.table is None:
+            return False
+        if tag in ("td", "th"):
+            self.lines[-1] += " |"   # empty cell -> "|  |", matching render
+            self.table["cells"] += 1
+            return True
+        if tag == "tr":
+            if self.table["row"] == 0:
+                self.lines.append("|" + "---|" * self.table["cells"])
+            self.table["row"] += 1
+            return True
+        if tag == "table":
+            self.table = None
+            self._flush_block()
+            self.swallow_br = True  # Apple: <object><table>..</table></object><br>
+            return True
+        if tag in ("tbody", "thead", "object", "div", "p", "span", "font",
+                   "colgroup", "col"):
+            return True
+        return False
+
     def handle_starttag(self, tag, attrs):
+        if tag == "br" and self.swallow_br and self.lines[-1] == "":
+            self.swallow_br = False
+            return  # trailing <br> of the div wrapping a table: an artifact
+        self.swallow_br = False
+        if self._table_start(tag):
+            return
         if tag == "br":
             self._newline()
         elif tag == "span":
@@ -91,11 +148,11 @@ class _Flattener(HTMLParser):
                     self.fmt.clear()
                     self.prefix = [_APPLE_H[m.group(1)]]
         elif tag in ("b", "strong"):
-            if self._in_heading():
-                return  # heading lines are implicitly bold on Apple
+            if self._in_heading() or (self.table and self.table["row"] == 0):
+                return  # heading lines / table headers are implicitly bold
             self._emit("**"); self.fmt.append("**")
         elif tag in ("i", "em"):
-            if self._in_heading():
+            if self._in_heading() or (self.table and self.table["row"] == 0):
                 return
             self._emit("*"); self.fmt.append("*")
         elif tag == "a":
@@ -111,8 +168,10 @@ class _Flattener(HTMLParser):
             self._flush_block()
 
     def handle_endtag(self, tag):
+        if self._table_end(tag):
+            return
         if tag in ("b", "strong", "i", "em"):
-            if self._in_heading():
+            if self._in_heading() or (self.table and self.table["row"] == 0):
                 return
             if self.fmt:
                 self._emit(self.fmt.pop())
@@ -130,6 +189,7 @@ class _Flattener(HTMLParser):
     def handle_data(self, data):
         if "\n" in data and not data.strip():
             return  # whitespace between tags (Apple pretty-prints), not content
+        self.swallow_br = False
         parts = data.split("\n")
         for i, part in enumerate(parts):
             if i:

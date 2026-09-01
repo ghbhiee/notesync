@@ -63,6 +63,45 @@ def _inline(text, profile):
     return "".join(out)
 
 
+def _split_row(ln):
+    """Parse one canonical pipe-table row ("| a | b |") -> cells, or None.
+    Only the exact canonical form renders; anything looser stays literal so
+    the flattener's rebuild is guaranteed byte-identical (fixed point)."""
+    if not (ln.startswith("| ") and ln.endswith(" |")) or len(ln) < 4:
+        return None
+    cells = ln[2:-2].split(" | ")
+    if any("|" in c for c in cells):
+        return None
+    if "| " + " | ".join(cells) + " |" != ln:
+        return None
+    return cells
+
+
+def _try_table(lines, i, profile):
+    """-> (html, lines_consumed) or None. Requires canonical header +
+    separator ("|---|" per column); data rows must match the column count."""
+    header = _split_row(lines[i])
+    if header is None or i + 1 >= len(lines):
+        return None
+    if lines[i + 1] != "|" + "---|" * len(header):
+        return None
+    rows, j = [], i + 2
+    while j < len(lines):
+        cells = _split_row(lines[j])
+        if cells is None or len(cells) != len(header):
+            break
+        rows.append(cells)
+        j += 1
+    out = ["<table><tr>"]
+    out += [f"<th>{_inline(c, profile)}</th>" for c in header]
+    out.append("</tr>")
+    for r in rows:
+        out.append("<tr>" + "".join(f"<td>{_inline(c, profile)}</td>" for c in r)
+                   + "</tr>")
+    out.append("</table>")
+    return "".join(out), j - i
+
+
 def render(md, profile):
     """markdown body -> markup fragment for the endpoint."""
     lines = md.split("\n")
@@ -76,7 +115,17 @@ def render(md, profile):
             out.append("</ul>")
             in_ul = False
 
-    for ln in lines:
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        i += 1
+        if ln.startswith("| "):
+            t = _try_table(lines, i - 1, profile)
+            if t:
+                close_ul()
+                out.append(t[0])
+                i += t[1] - 1
+                continue
         if ln == "":
             close_ul()
             out.append(profile.blank)

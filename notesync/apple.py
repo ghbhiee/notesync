@@ -23,6 +23,7 @@ from .evernote import _Flattener
 
 BRIDGE = Path(__file__).parent / "apple_bridge.js"
 MEDIA_MARKERS = ("<img", "<object", "data:image", "<attachment", "en-media")
+_TABLE_OBJECT = re.compile(r"<object>\s*<table")
 
 
 def _bridge(*args):
@@ -89,7 +90,10 @@ class AppleEndpoint:
 
     def _parse(self, row):
         name, raw = row.get("name", ""), row.get("body") or ""
-        if row.get("locked") or any(m in raw for m in MEDIA_MARKERS):
+        # Apple renders our <table> as <object><table>...; that's content,
+        # not an attachment -- only non-table objects freeze the note
+        probe = _TABLE_OBJECT.sub("<table", raw)
+        if row.get("locked") or any(m in probe for m in MEDIA_MARKERS):
             return (name, None, row["mod"])  # frozen: hands off
         lines = html_to_md(raw).split("\n")
         title = name
