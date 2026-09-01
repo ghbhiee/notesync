@@ -89,13 +89,37 @@ func mdToHTML(_ md: String) -> String {
                                    with: "<a href=\"$2\">$1</a>", options: .regularExpression)
         return t
     }
+    func cells(_ ln: String) -> [String] {
+        var t = ln.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("|") { t.removeFirst() }
+        if t.hasSuffix("|") { t.removeLast() }
+        return t.components(separatedBy: "|").map {
+            inline($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
     var out: [String] = []
     var inUl = false, inOl = false
     func closeLists() {
         if inUl { out.append("</ul>"); inUl = false }
         if inOl { out.append("</ol>"); inOl = false }
     }
-    for ln in md.components(separatedBy: "\n") {
+    let lines = md.components(separatedBy: "\n")
+    var i = 0
+    while i < lines.count {
+        let ln = lines[i]
+        if ln.hasPrefix("|"), i + 1 < lines.count,
+           lines[i + 1].range(of: #"^\|[-| :]+\|?$"#, options: .regularExpression) != nil {
+            closeLists()
+            var html = "<table><tr>" + cells(ln).map { "<th>\($0)</th>" }.joined() + "</tr>"
+            var j = i + 2
+            while j < lines.count, lines[j].hasPrefix("|") {
+                html += "<tr>" + cells(lines[j]).map { "<td>\($0)</td>" }.joined() + "</tr>"
+                j += 1
+            }
+            out.append(html + "</table>")
+            i = j
+            continue
+        }
         if ln.hasPrefix("# ") { closeLists(); out.append("<h1>\(inline(String(ln.dropFirst(2))))</h1>") }
         else if ln.hasPrefix("## ") { closeLists(); out.append("<h2>\(inline(String(ln.dropFirst(3))))</h2>") }
         else if ln.hasPrefix("### ") { closeLists(); out.append("<h3>\(inline(String(ln.dropFirst(4))))</h3>") }
@@ -117,16 +141,20 @@ func mdToHTML(_ md: String) -> String {
         }
         else if ln.isEmpty { closeLists(); out.append("<div class=blank></div>") }
         else { closeLists(); out.append("<p>\(inline(ln))</p>") }
+        i += 1
     }
     closeLists()
     let css = """
     :root { color-scheme: light dark; }
     body { font: 14px/1.7 -apple-system, 'PingFang SC', sans-serif; margin: 0;
-           padding: 16px 20px; color: CanvasText; background: Canvas; max-width: 44em; }
+           padding: 16px 20px; color: CanvasText; background: Canvas; max-width: 46em; }
     h1 { font-size: 1.5em; margin: .6em 0 .3em; } h2 { font-size: 1.25em; margin: .6em 0 .3em; }
     h3 { font-size: 1.1em; margin: .5em 0 .3em; }
     p { margin: .2em 0; } ul, ol { margin: .2em 0; padding-left: 1.4em; }
     .blank { height: .9em; } .todo { margin: .2em 0; }
+    table { border-collapse: collapse; margin: .5em 0; font-size: .95em; }
+    th, td { border: 1px solid rgba(127,127,127,.45); padding: 4px 9px; text-align: left; }
+    th { background: rgba(127,127,127,.12); }
     code { font-family: ui-monospace, Menlo, monospace; font-size: .9em;
            background: rgba(127,127,127,.15); border-radius: 4px; padding: 1px 5px; }
     a { color: -apple-system-blue; }
@@ -216,25 +244,37 @@ final class BrowserController: NSObject, NSTableViewDataSource, NSTableViewDeleg
     let window = makeWindow("NoteSync 笔记浏览器", 780, 520)
     let table = NSTableView()
     let versions = NSPopUpButton(frame: .zero, pullsDown: false)
+    let sortSel = NSPopUpButton(frame: .zero, pullsDown: false)
     let mode = NSSegmentedControl(labels: ["预览", "源码"], trackingMode: .selectOne,
                                   target: nil, action: nil)
     let text = NSTextView()
     let web = WKWebView(frame: .zero)
     var textScroll: NSScrollView!
     var currentContent = ""
-    var files: [String] = []          // repo-relative paths
+    var fileInfos: [(rel: String, created: Date, modified: Date)] = []
     var commits: [(sha: String, label: String)] = []
 
     override init() {
         super.init()
         let v = window.contentView!
-        let side = NSScrollView(frame: NSRect(x: 0, y: 0, width: 260, height: 520))
+        sortSel.frame = NSRect(x: 6, y: 488, width: 248, height: 24)
+        sortSel.autoresizingMask = [.minYMargin]
+        sortSel.addItems(withTitles: ["按更新时间 ↓", "按创建时间 ↓"])
+        sortSel.target = self
+        sortSel.action = #selector(sortChanged)
+        v.addSubview(sortSel)
+
+        let side = NSScrollView(frame: NSRect(x: 0, y: 0, width: 260, height: 482))
         side.autoresizingMask = [.height]
         side.hasVerticalScroller = true
-        let col = NSTableColumn(identifier: .init("f"))
-        col.title = "笔记"
-        col.width = 240
-        table.addTableColumn(col)
+        let colName = NSTableColumn(identifier: .init("f"))
+        colName.title = "笔记"
+        colName.width = 156
+        table.addTableColumn(colName)
+        let colDate = NSTableColumn(identifier: .init("d"))
+        colDate.title = "日期"
+        colDate.width = 78
+        table.addTableColumn(colDate)
         table.dataSource = self
         table.delegate = self
         table.headerView = nil
@@ -276,28 +316,50 @@ final class BrowserController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         present(window)
     }
 
+    @objc func sortChanged() { reloadFiles() }
+
     func reloadFiles() {
-        var out: [String] = []
+        var out: [(rel: String, created: Date, modified: Date)] = []
         let base = URL(fileURLWithPath: syncDir)
-        if let en = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) {
+        let keys: [URLResourceKey] = [.creationDateKey, .contentModificationDateKey]
+        if let en = FileManager.default.enumerator(at: base, includingPropertiesForKeys: keys) {
             for case let u as URL in en where u.pathExtension == "md" {
-                out.append(String(u.path.dropFirst(syncDir.count + 1)))
+                let rv = try? u.resourceValues(forKeys: Set(keys))
+                out.append((String(u.path.dropFirst(syncDir.count + 1)),
+                            rv?.creationDate ?? .distantPast,
+                            rv?.contentModificationDate ?? .distantPast))
             }
         }
-        files = out.sorted()
+        let byCreated = sortSel.indexOfSelectedItem == 1
+        fileInfos = out.sorted { byCreated ? $0.created > $1.created
+                                           : $0.modified > $1.modified }
         table.reloadData()
-        if !files.isEmpty {
+        if !fileInfos.isEmpty {
             table.selectRowIndexes([0], byExtendingSelection: false)
         }
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { files.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { fileInfos.count }
 
     func tableView(_ tv: NSTableView, viewFor col: NSTableColumn?, row: Int) -> NSView? {
-        let id = NSUserInterfaceItemIdentifier("cell")
+        let isDate = col?.identifier.rawValue == "d"
+        let id = NSUserInterfaceItemIdentifier(isDate ? "cd" : "cf")
         let tf = tv.makeView(withIdentifier: id, owner: nil) as? NSTextField
-            ?? { let t = NSTextField(labelWithString: ""); t.identifier = id; t.lineBreakMode = .byTruncatingMiddle; return t }()
-        tf.stringValue = (files[row] as NSString).deletingPathExtension
+            ?? { let t = NSTextField(labelWithString: ""); t.identifier = id
+                 t.lineBreakMode = .byTruncatingMiddle; return t }()
+        let info = fileInfos[row]
+        if isDate {
+            let f = DateFormatter()
+            f.dateFormat = "MM-dd HH:mm"
+            tf.stringValue = f.string(from: sortSel.indexOfSelectedItem == 1
+                                      ? info.created : info.modified)
+            tf.font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+            tf.textColor = .secondaryLabelColor
+        } else {
+            tf.stringValue = (info.rel as NSString).deletingPathExtension
+            tf.font = NSFont.systemFont(ofSize: 12)
+            tf.textColor = .labelColor
+        }
         return tf
     }
 
@@ -307,7 +369,7 @@ final class BrowserController: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     var selected: String? {
         let r = table.selectedRow
-        return (r >= 0 && r < files.count) ? files[r] : nil
+        return (r >= 0 && r < fileInfos.count) ? fileInfos[r].rel : nil
     }
 
     func loadVersions() {
