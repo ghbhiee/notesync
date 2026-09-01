@@ -28,6 +28,7 @@ def sync_once(cfg, eps_by_mapping=None, log=lambda m: None):
     conflicts = state_dir / "conflicts"
     conflicts.mkdir(parents=True, exist_ok=True)
 
+    IGNORED_FILES.update(cfg.get("ignore_files", []))
     lock = open(state_dir / "lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -60,12 +61,19 @@ def sync_once(cfg, eps_by_mapping=None, log=lambda m: None):
         lock.close()
 
 
+# md files in the store that are not notes (knowledge-base metafiles etc.);
+# extendable via config "ignore_files"
+IGNORED_FILES = {"AGENTS.md", "CLAUDE.md"}
+
+
 def _scan_files(folder, owner_names):
     """-> uuid -> {title, body(normalized), mtime, path}. Assigns uuids to
     front-matter-less files. A duplicated uuid (user copied a file) keeps the
     identity on the db-registered filename and forks a fresh one for the copy."""
     entries = []
     for p in sorted(folder.glob("*.md")):
+        if p.name in IGNORED_FILES:
+            continue
         raw = p.read_text(encoding="utf-8")
         uid, body = split_fm(raw)
         entries.append([p, uid, body])
@@ -301,7 +309,8 @@ def _mirror(store_root, dst_root, log):
     """One-way copy of the canonical store into a plain folder (e.g. the
     Google Drive client folder). Not an endpoint: never merged back."""
     dst_root.mkdir(parents=True, exist_ok=True)
-    src = {p.relative_to(store_root): p for p in store_root.rglob("*.md")}
+    src = {p.relative_to(store_root): p for p in store_root.rglob("*.md")
+           if p.name not in IGNORED_FILES}
     for rel, sp in src.items():
         dp = dst_root / rel
         data = sp.read_bytes()
