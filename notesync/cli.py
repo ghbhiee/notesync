@@ -1,5 +1,5 @@
-"""notesync CLI: init / status / sync / watch / rerender / audit / lint /
-profile / preview (DESIGN.md #10, #12).
+"""notesync CLI: init / status / sync / watch / mail / rerender / audit /
+lint / profile / preview (DESIGN.md #10, #12).
 
 M1 scope: file endpoint only -- versioned canonical store with history.
 Note-app endpoints arrive in M2 (Evernote) and M3 (Apple Notes).
@@ -27,6 +27,8 @@ DEFAULT_CFG = {
     "mappings": [{"name": "sync", "folder": "", "apple_folder": "SYNC",
                   "apple_enabled": True, "en_notebook": "SYNC",
                   "en_enabled": True}],
+    # mail-to-note import (mailin.py); every other key has a default there
+    "mail_import": {"enabled": False, "address": ""},
 }
 
 
@@ -90,6 +92,17 @@ def build_eps(cfg):
     return eps_by_mapping, closer
 
 
+def mail_step(cfg):
+    """The mail-to-note import, after a sync cycle. Independent of the
+    sync mappings, and a failure here never disturbs the sync loop."""
+    try:
+        from .mailin import run_once
+        return run_once(cfg, log=tlog)
+    except Exception as e:
+        tlog(f"[mail error] {e}")
+        return 0
+
+
 def cmd_sync(args):
     cfg = load_cfg(args.config)
     eps, closer = build_eps(cfg)
@@ -98,12 +111,20 @@ def cmd_sync(args):
     finally:
         closer()
     tlog(f"cycle done: {n} note(s) touched")
+    mail_step(cfg)
 
 
 def cmd_watch(args):
     cfg = load_cfg(args.config)
     interval = args.interval or min(cfg["poll_apple_seconds"], cfg["poll_evernote_seconds"])
     tlog(f"watching every {interval}s (ctrl-c to stop)")
+    waiter = None
+    if (cfg.get("mail_import") or {}).get("enabled"):
+        # the Mail rule (notesync mail --install-rule) touches a trigger file
+        from .mailin import TriggerWait
+        waiter = TriggerWait()
+        if waiter.kq is not None:
+            tlog("mail import: real-time trigger armed")
     eps, closer = None, None
     while True:
         try:
@@ -117,7 +138,40 @@ def cmd_watch(args):
             if closer:
                 closer()
             eps, closer = None, None
-        time.sleep(interval)
+        mail_step(cfg)
+        if waiter is None:
+            time.sleep(interval)
+            continue
+        # between cycles a Mail rule may wake us: import right away, while
+        # the sync cadence stays as it is
+        deadline = time.time() + interval
+        while waiter.wait(deadline - time.time()):
+            time.sleep(2)  # let Mail finish filing the message
+            if not mail_step(cfg):
+                time.sleep(10)  # the rule can run before the message is listed
+                mail_step(cfg)
+
+
+def cmd_mail(args):
+    """One-shot mail-to-note import (runs even if disabled in the config);
+    flags override the config for this run only."""
+    from .mailin import install_rule, remove_rule, run_once, settings
+    cfg = load_cfg(args.config)
+    if args.remove_rule:
+        remove_rule()
+        tlog("Mail rule removed")
+        return
+    if args.install_rule:
+        path = install_rule(cfg)
+        tlog(f"Mail rule installed (runs {path.name}); restart the watcher to arm it")
+        return
+    over = {k: v for k, v in (("address", args.address), ("notes_folder", args.folder),
+                              ("after_import", args.after)) if v is not None}
+    if not settings({"mail_import": {**(cfg.get("mail_import") or {}), **over}})["addresses"]:
+        sys.exit('no import address: set "mail_import": {"address": ...} in the config '
+                 "or pass --address")
+    n = run_once(cfg, log=tlog, dry_run=args.dry_run, overrides=over, force=True)
+    tlog(f"mail: {n} note(s) created" + (" (dry run)" if args.dry_run else ""))
 
 
 def cmd_rerender(args):
@@ -274,6 +328,10 @@ def cmd_status(args):
         print(f"store: {cfg['store']}")
         for r in rows:
             print(f"  {r['status']}: {r['c']}")
+        mails = db.con.execute(
+            "SELECT status, COUNT(*) c FROM mail_import GROUP BY status").fetchall()
+        if mails:
+            print("mail import: " + ", ".join(f"{r['status']} {r['c']}" for r in mails))
         print("recent activity:")
         for r in db.con.execute(
                 "SELECT ts, action, detail FROM oplog ORDER BY ts DESC LIMIT 10"):
@@ -288,7 +346,7 @@ def main(argv=None):
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in [("init", cmd_init), ("sync", cmd_sync),
-                     ("watch", cmd_watch), ("status", cmd_status),
+                     ("watch", cmd_watch), ("mail", cmd_mail), ("status", cmd_status),
                      ("rerender", cmd_rerender), ("audit", cmd_audit),
                      ("lint", cmd_lint), ("profile", cmd_profile),
                      ("preview", cmd_preview)]:
@@ -296,6 +354,19 @@ def main(argv=None):
         p.set_defaults(fn=fn)
         if name == "watch":
             p.add_argument("--interval", type=int)
+        if name == "mail":
+            p.add_argument("--dry-run", action="store_true",
+                           help="list what would be imported; create nothing")
+            p.add_argument("--address", help="import address (overrides the config)")
+            p.add_argument("--folder", help="Notes folder name or id (default: the "
+                           "configured one, else the default folder)")
+            p.add_argument("--after", choices=["move", "flag", "read", "none"],
+                           help="what to do with an imported mail")
+            p.add_argument("--install-rule", action="store_true",
+                           help="create the Mail rule that triggers an import the "
+                           "moment such mail arrives")
+            p.add_argument("--remove-rule", action="store_true",
+                           help="remove that Mail rule")
         if name == "rerender":
             p.add_argument("notes", nargs="*",
                            help="only notes whose title contains one of these")

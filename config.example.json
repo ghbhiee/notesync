@@ -8,6 +8,20 @@
   "gdrive_enabled": false,
   "probe_apple_folder": "NoteSync-Probe",
   "probe_en_notebook": "NoteSync-Probe",
+  "mail_import": {
+    "enabled": false,
+    "address": "notes-inbox@example.com",
+    "account": "iCloud",
+    "mailbox": "INBOX",
+    "include_bcc": true,
+    "lookback_days": 1,
+    "allowed_senders": [],
+    "notes_account": "",
+    "notes_folder": "",
+    "after_import": "move",
+    "done_mailbox": "NoteSync",
+    "max_attachment_mb": 50
+  },
   "mappings": [
     {
       "name": "sync",

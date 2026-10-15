@@ -47,6 +47,50 @@
 - JXA：`folders.byName` 遇到同名文件夹会随便挑一个（且不固定）→ bridge 现在拒绝不唯一的文件夹名（否则一翻转就像全部笔记被删）；`app.delete(folders.byName(...))` 对文件夹静默无效，要用 byId
 - Evernote：ENML 原样存储（`-en-codeblock`、`<code>`、`<blockquote>`、`<ol start>`、嵌套列表、`&nbsp;` 都原样读回）；编辑器改写后的形态（如 `<li><div>…</div></li>`）拍平器已兼容
 
+## 邮件转笔记（2026-10-15）
+
+独立入口（类似 Evernote 的“邮件入笔记”）：发到某个指定地址的邮件，自动变成 Apple Notes **默认文件夹**里的一条笔记（可配置到别的文件夹）。不走 SYNC、不进 mapping、导入后不再同步。代码：`notesync/mailin.py`（解析 + 每轮步骤）、`mail_bridge.js`（Mail 侧）、`notes_create.applescript`（Notes 侧建带图笔记）。
+
+- **接收：Mail.app + osascript 轮询，不用 IMAP。**Mail 本来就在后台同步该账户，我们只读它已经拉下来的邮件：零凭据、近零开销、不抢焦点、锁屏可跑。每轮 watch（以及菜单「立即同步」）在 sync 之后跑一次；Mail 没在运行就跳过（绝不拉起 Mail）
+- **作用域**：INBOX 里其它邮件只批量取收件人列表比对（to/cc），Bcc 靠 Mail 内部求值的 `whose allHeaders contains` 过滤、只回传命中 id，再用投递头确认；只有命中的邮件才读 `source`
+- **流水线**：AppleScript 只负责“筛出目标邮件 + 交出原始 MIME（写到临时文件）”，解析全在 Python `email`：主题→标题（去 Fwd:/转发: 前缀；正文首段重复标题时去掉），HTML 优先、否则纯文本（支持 format=flowed），HTML 清洗成白名单子集（布局表格拆开、样式脚本丢弃、链接目标以文字保留——Apple 会剥 href），cid 内嵌图 / data: 图 / 附件落临时目录后以 `file://` 引用；远程图片不抓取（隐私、追踪像素），保留成 `[image] (url)` 文字
+- **去重**：Message-ID → `state.db` 的 `mail_import` 表（无 Message-ID 时用 接收时间+主题+发件人 的哈希）；失败重试 3 次后放弃并留在收件箱。顺序是“建笔记 → 记库 → 标记邮件”：宁可极小概率重复，不可丢
+- **可见标记**：默认移到该账户的 `NoteSync` 邮箱（不存在就建）；也可只标已读 / 加旗 / 不动（`after_import`）。已导入但仍在收件箱（上次移动失败）的会重试移动
+- **扫描窗口**：默认只看最近 1 天（`lookback_days`，用户要求“只看当天”）。但 Mail 的接收时间是**服务器时间**，Mac 睡眠 / 关机期间到的信醒来后已经“不是今天”——固定窗口会永久漏掉。所以窗口同时向回覆盖到“上次成功扫描 − 1 小时”（`state.db` 的 `meta.mail_last_scan`，上限 30 天）：平时只扫一天，停机后自动补扫。Mail 没开着、dry-run、带参数覆盖的一次性 `mail` 命令都不推进这个标记
+- 配置 `mail_import`（见 config.example.json）：`enabled`、`address`（可多个）、`include_bcc`、`lookback_days`、`allowed_senders`（空 = 任何人）、`notes_account`/`notes_folder`、`after_import`、`done_mailbox`、`max_attachment_mb`
+- CLI：`notesync mail [--dry-run] [--address A] [--folder F] [--after move|flag|read|none]`——一次性导入（无视 enabled），参数只覆盖本次；`--install-rule` / `--remove-rule` 管实时触发的 Mail 规则（见下）；`status` 多一行导入计数
+
+### 实时触发（Mail 规则 → 触发文件 → kqueue）
+
+- `notesync mail --install-rule` 在 Mail 里建规则「NoteSync mail import」：任一收件人包含导入地址 → 运行 `~/Library/Application Scripts/com.apple.mail/NoteSync Mail Import.scpt`。脚本只做一件事：`touch ~/Library/Caches/NoteSync/mail.trigger`（放 Caches 而不放 ~/Documents：规则脚本碰不到 TCC）。规则放在最前、不移动 / 不标记 / 不停止后续规则；`--remove-rule` 删规则和脚本
+- watch 循环把 `time.sleep(300)` 换成 kqueue 等触发文件（`TriggerWait`）：空闲零开销；触发后等 2 秒（让 Mail 把信归档好）只跑邮件步骤，没导入到就 10 秒后再试一次；sync 节奏不变。sync 期间来的触发由 kqueue 排队（EV_CLEAR 合并），下一次等待立刻返回，不会丢
+- 实测：发信 → 9 秒后 Mail 应用规则 → 12 秒后笔记进备忘录。5 分钟轮询保留兜底：Bcc（规则只认收件人）、规则没跑的情况（如 Mail 当时没开）都由它接住——规则坏掉期间的测试信正是轮询导入的
+
+**真机怪癖（全是这次踩的）**
+- **`run script` 的脚本路径**：脚本接口的 setter 只收“存在的绝对路径”并原样存进 `SyncedRules.plist`，但 Mail 运行规则时把它当成**相对脚本文件夹**的路径 → `<文件夹>/<绝对路径>` → ENOENT。规则照样“命中、应用”，只在 Mail 日志里留一行 `Failed to create an NSUserAppleScriptTask … No such file or directory`。getter 读回的就是那条拼错的路径（这是线索）。解法：在那条嵌套路径上也放一份脚本（安装命令自动做）
+- **`header key` 条件不可脚本化**：记录里写 `rule type:header key` 会被解析成 `header` 属性，条件悄悄变成「发件人包含」；用原始码 `«constant ****thdk»` 一样；建好后再 `set rule type` / 删单个条件 → **Mail 直接崩溃**（-609）。所以规则只认收件人，Bcc 交给轮询
+- 规则的“是否在本机启用”存在 `RulesActiveState.plist`（RuleId → bool），规则本体在 iCloud 同步的 `SyncedRules.plist`；别的 Mac 同步到这条规则但没有脚本，只会记一行错误
+- 查 Mail 自己的日志才看得到规则执行结果：`/usr/bin/log show --predicate 'process == "Mail"'`（zsh 里 `log` 是内建命令，不写全路径什么也查不到）；关键 category `MFMessageRouter`
+
+### Apple Notes 写图实测（真机，全部推翻过预判）
+
+验证不驱动 UI：只读打开 `NoteStore.sqlite`（`file:...?mode=ro`），看 `ZICCLOUDSYNCINGOBJECT` 的 `ZTYPEUTI`、`ZMEDIA→ZFILENAME`，再把 `ZICNOTEDATA.ZDATA`（gzip 的 protobuf）解开数正文里的附件占位符 U+FFFC。
+
+- `<img src="data:image/png;base64,…">` 写进 body：生成一个 **`public.data` 无类型附件**（显示成文件图标，不是图片），body 读回只剩空段落——mime、width/alt 怎么写都一样
+- `make new attachment`（AppleScript `at end of attachments of n` / `at n` / `tell n`、JXA `make` 四种写法全试）：附件对象只有一个 `public.png`，但**正文里插了两个占位符 → 图显示两次**；脚本层读 `attachments` 也列两条
+- `<img src="file://…">`：Notes 是沙盒 App，**没拿到文件读权限时导入成空图**（body 读回 `data:image/png;base64,(null)`，无 media 行）——放 `/var/folders/…/T`、`/private/tmp`、`~/Documents`、`~/Library/Caches` 全一样。读权限来自 Apple Event 里的文件引用：先 `tell application "Notes" to exists {POSIX file …}`（无副作用）把引用递过去，之后 file:// 图片导入为**类型正确（按扩展名推断 UTI）、位置正确、只一份、带原文件名**的附件；PDF、txt 同理。`get` 不行（AppleScript 本地解析，事件没发到 Notes）；JXA `app.exists(Path(…))` 报 -1728，所以建笔记这一步用 AppleScript
+- 拿到权限后 create 是同步读文件的：建完立刻删临时文件不影响；文件名含中文 / 空格 / `#&` 用 `Path.as_uri()` 百分号编码即可
+- `base64,(null)` 是可监测的失败信号：导入后读回一次，日志里报“N image(s) EMPTY”
+
+### Mail 实测
+
+- **`source()` 按“一字节一字符”（Latin-1）解码原始字节**：8bit 传输的 UTF-8 正文变成乱码（真实翻车：第一次端到端正文全是 `é®ä»¶…`，标题因为走 RFC 2047 编码反而正常）。写文件时按 Latin-1 编回即得原始字节，不能无损时才退回 UTF-8
+- `messages.toRecipients.address()` 一个 Apple Event 返回整箱的嵌套数组，26 封全量扫描约 0.2 s；`whose({dateReceived: {_greaterThan: d}})` 可用，`_and` 可组合
+- iCloud 给每封投递加 `Original-recipient: rfc822;<地址>`（Bcc 也有）；`message id` 不带尖括号，移动邮箱后不变（Mail 内部 `id` 会变）
+- 建邮箱 `Mail.make({new: "mailbox", withProperties: {name}, at: account})`、移动 `Mail.move(m, {to: box})` 可用；刚删 / 刚移完立刻读 `messages.length` 可能还是旧值
+- `Application("Mail").running()` 不发 Apple Event、不会拉起 Mail
+- TCC：引擎宿主（NoteSyncBar）需要「自动化 → 邮件」。没授权 → -1743，日志提示去系统设置开；权限弹窗没人答时 osascript 会一直等 → 扫描 60 s 超时后暂停 30 分钟，免得每轮卡住 sync
+
 ## 全量 bootstrap 实战教训（2026-08-30，白名单前的一次性经历）
 
 - EN 限速（across all tools）会打断长 bootstrap：错误隔离 + 65s 退避 + create 失败回滚（rollback 也要退避，否则留孤儿 → 下轮变 (2) 副本）

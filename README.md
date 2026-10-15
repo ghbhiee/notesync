@@ -28,6 +28,7 @@ The pain lives in the intersection. Something written in one system is invisible
 - Deletions propagate to all ends — each into its own trash/Recently Deleted, files recoverable from git history
 - Notes containing images/attachments are excluded automatically (frozen) — content is never destroyed
 - Optional one-way mirror into a Google Drive folder
+- Optional mail-to-note inbox: mail sent to an address you choose (written directly, or forwarded from any mail account or app) becomes an Apple Notes note in your default folder, inline images and attachments included — a separate entry point, outside the synced folder
 - Menu bar app: status, manual sync, a note browser with per-version git history and markdown preview, reverse-chronological logs, settings
 
 ## How it works
@@ -50,6 +51,8 @@ The core invariant of the format layer: **`flatten(render(md)) == md`** for ever
 
 Endpoint copies that still differ from the file (a lossy copy) are remembered, and an edit made there is rebased onto the canonical text line by line, so untouched lines — code indentation above all — can never be flattened into the file. `notesync audit --live` round-trips every note through probe containers to prove fidelity; `notesync lint` checks a note against the profile.
 
+The mail-to-note inbox (`mail_import` in the config) reads what Mail.app has already downloaded, over Apple Events — no IMAP connection, no stored password. Each cycle it finds the inbox messages addressed to the import address (other messages are matched on their recipients only, never read), parses the raw source with Python's `email` package, and creates the note: subject as title, HTML or text as body, `cid:` images in place, attachments after. The Message-ID is recorded so nothing is imported twice, and the mail is moved to a `NoteSync` mailbox (or flagged / marked read). `notesync mail --dry-run` shows what would be imported. For real time, `notesync mail --install-rule` adds a Mail rule whose script only touches a trigger file; the watcher waits on that file with kqueue (no polling) and imports within seconds of arrival, while the regular cycle remains the fallback.
+
 Hard-won endpoint facts are documented in [DEVLOG.zh.md](DEVLOG.zh.md) (Chinese): Evernote's search index lies in both directions (deletion needs primary-key confirmation), Apple's note `name` is a truncated first line, notes in Recently Deleted are still readable by id, and more.
 
 ## Install
@@ -64,7 +67,7 @@ cp -R NoteSyncBar.app /Applications/ && open /Applications/NoteSyncBar.app
 
 Requirements: macOS 13+, Xcode command line tools, Node (Evernote is reached through the official MCP server via `npx mcp-remote`; complete the Evernote OAuth once in any MCP client — credentials are shared in `~/.mcp-auth`). On first launch, allow the app access to Documents and iCloud Drive. See `config.example.json` (`engine_dir` should point at your clone); the menu bar app has a settings panel too.
 
-The engine is plain-stdlib Python; the app is a single-file AppKit program. CLI: `python3 -m notesync init|sync|status|watch|rerender|audit|lint|profile`.
+The engine is plain-stdlib Python; the app is a single-file AppKit program. CLI: `python3 -m notesync init|sync|status|watch|mail|rerender|audit|lint|profile`. The mail inbox needs Mail.app running with the account set up, and the app hosting the engine allowed to control Mail (System Settings › Privacy & Security › Automation).
 
 ## Documents
 

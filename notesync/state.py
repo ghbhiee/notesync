@@ -30,6 +30,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS ep_native ON ep_map(ep, native_id);
 CREATE TABLE IF NOT EXISTS oplog(
   ts REAL, uuid TEXT, action TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS meta(
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS mail_import(
+  message_id TEXT PRIMARY KEY,
+  ts         REAL,
+  subject    TEXT,
+  sender     TEXT,
+  note_id    TEXT,
+  status     TEXT NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  error      TEXT
+);
 """
 
 
@@ -123,7 +137,34 @@ class DB:
                          (seen_rev, uid, ep))
         self.con.commit()
 
+    # -- mail-to-note import (mailin.py) -----------------------------------
+    def mail_get(self, message_id):
+        return self.con.execute("SELECT * FROM mail_import WHERE message_id=?",
+                                (message_id,)).fetchone()
+
+    def mail_record(self, message_id, subject, sender, note_id, status, error):
+        """status: imported | failed. attempts counts every try."""
+        self.con.execute(
+            """INSERT INTO mail_import(message_id, ts, subject, sender, note_id,
+                                       status, attempts, error)
+               VALUES(?,?,?,?,?,?,1,?)
+               ON CONFLICT(message_id) DO UPDATE SET ts=excluded.ts,
+                 subject=excluded.subject, sender=excluded.sender,
+                 note_id=excluded.note_id, status=excluded.status,
+                 attempts=mail_import.attempts+1, error=excluded.error""",
+            (message_id, time.time(), subject, sender, note_id, status, error))
+        self.con.commit()
+
     # -- misc -------------------------------------------------------------
+    def meta_get(self, key):
+        r = self.con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def meta_set(self, key, value):
+        self.con.execute("INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) "
+                         "DO UPDATE SET value=excluded.value", (key, str(value)))
+        self.con.commit()
+
     def oplog(self, uid, action, detail=""):
         self.con.execute("INSERT INTO oplog VALUES(?,?,?,?)",
                          (time.time(), uid, action, detail))
