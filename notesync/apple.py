@@ -19,7 +19,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .evernote import _Flattener
+from .flatten import apple_entities, flatten
 
 BRIDGE = Path(__file__).parent / "apple_bridge.js"
 MEDIA_MARKERS = ("<img", "<object", "data:image", "<attachment", "en-media")
@@ -34,10 +34,45 @@ def _bridge(*args):
     return json.loads(r.stdout)
 
 
+_TT = '<div><font face="Courier"><tt>{}</tt></font></div>'
+
+
+def model_store(h):
+    """Offline model of how Apple Notes rewrites the HTML we write (each
+    rule captured from a live probe). Used by the tests and by the offline
+    audit, so both see what the flattener sees in production."""
+    # <pre> -> one monospaced paragraph per line
+    def pre(m):
+        lines = m.group(1).split("\n")
+        return "".join(_TT.format(ln if ln else "<br>") for ln in lines)
+    h = re.sub(r"<pre>(.*?)</pre>", pre, h, flags=re.S)
+    # inline <code> -> Courier run
+    h = re.sub(r"<code>(.*?)</code>",
+               r'<font face="Courier"><span style="font-size: 12px">\1</span></font>', h)
+    # h1/h2 -> bold font-size spans
+    h = re.sub(r"<h1>(.*?)</h1>",
+               r'<div><b><span style="font-size: 24px">\1</span></b></div>', h)
+    h = re.sub(r"<h2>(.*?)</h2>",
+               r'<div><b><span style="font-size: 18px">\1</span></b></div>', h)
+    # nbsp is returned as a plain space
+    h = h.replace("&nbsp;", " ")
+    # tables are wrapped as objects; the first blank paragraph after one is
+    # absorbed into the wrapper's trailing <br>
+    h = re.sub(r"<table>(.*?)</table>(<div><br></div>)?",
+               r"<div><object><table><tbody>\1</tbody></table></object><br></div>",
+               h, flags=re.S)
+    # nested lists come back in sibling form
+    for _ in range(4):
+        h = re.sub(r"<li>([^<]*(?:<(?!/?li\b|/?[uo]l\b)[^>]*>[^<]*)*)"
+                   r"(<(ul|ol)>.*?</\3>)</li>", r"<li>\1</li>\2", h, flags=re.S)
+    # italic is dropped from CJK text (PingFang has none)
+    h = re.sub(r"<i>([^<]*[\u2e80-\u9fff\uff00-\uffef][^<]*)</i>", r"\1", h)
+    # entities lose their semicolons
+    return re.sub(r"&(amp|lt|gt|quot);", r"&\1", h)
+
+
 def html_to_md(body: str) -> str:
-    f = _Flattener()
-    f.feed(body)
-    return f.result()
+    return flatten(apple_entities(body))
 
 
 def md_to_html(title: str, body: str) -> str:

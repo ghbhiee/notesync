@@ -6,6 +6,8 @@
   "poll_evernote_seconds": 300,
   "gdrive_mirror": null,
   "gdrive_enabled": false,
+  "probe_apple_folder": "NoteSync-Probe",
+  "probe_en_notebook": "NoteSync-Probe",
   "mappings": [
     {
       "name": "sync",

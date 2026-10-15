@@ -1,7 +1,10 @@
 // NoteSyncBar: menu bar host for the notesync engine (DESIGN.md M5).
 // TCC "responsible app": the python watch loop runs as our child and
 // inherits the Documents / iCloud grants. v1.1 adds a settings window,
-// a note browser with git history, and a reverse-chronological log view.
+// a note browser with git history, and a reverse-chronological log view;
+// v1.2 a format check window (notesync lint), and the browser preview is
+// rendered by the engine itself (notesync preview) -- one markdown
+// implementation, not two.
 import AppKit
 import ServiceManagement
 import WebKit
@@ -74,92 +77,32 @@ func present(_ win: NSWindow) {
     win.makeKeyAndOrderFront(nil)
 }
 
-func mdToHTML(_ md: String) -> String {
-    func esc(_ x: String) -> String {
-        x.replacingOccurrences(of: "&", with: "&amp;")
-         .replacingOccurrences(of: "<", with: "&lt;")
-         .replacingOccurrences(of: ">", with: "&gt;")
-    }
-    func inline(_ x: String) -> String {
-        var t = esc(x)
-        t = t.replacingOccurrences(of: #"\*\*(.+?)\*\*"#, with: "<b>$1</b>", options: .regularExpression)
-        t = t.replacingOccurrences(of: #"(?<!\*)\*([^*]+)\*(?!\*)"#, with: "<i>$1</i>", options: .regularExpression)
-        t = t.replacingOccurrences(of: #"`([^`]+)`"#, with: "<code>$1</code>", options: .regularExpression)
-        t = t.replacingOccurrences(of: #"\[([^\]]+)\]\((https?://[^\s)]+)\)"#,
-                                   with: "<a href=\"$2\">$1</a>", options: .regularExpression)
-        return t
-    }
-    func cells(_ ln: String) -> [String] {
-        var t = ln.trimmingCharacters(in: .whitespaces)
-        if t.hasPrefix("|") { t.removeFirst() }
-        if t.hasSuffix("|") { t.removeLast() }
-        return t.components(separatedBy: "|").map {
-            inline($0.trimmingCharacters(in: .whitespaces))
-        }
-    }
-    var out: [String] = []
-    var inUl = false, inOl = false
-    func closeLists() {
-        if inUl { out.append("</ul>"); inUl = false }
-        if inOl { out.append("</ol>"); inOl = false }
-    }
-    let lines = md.components(separatedBy: "\n")
-    var i = 0
-    while i < lines.count {
-        let ln = lines[i]
-        if ln.hasPrefix("|"), i + 1 < lines.count,
-           lines[i + 1].range(of: #"^\|[-| :]+\|?$"#, options: .regularExpression) != nil {
-            closeLists()
-            var html = "<table><tr>" + cells(ln).map { "<th>\($0)</th>" }.joined() + "</tr>"
-            var j = i + 2
-            while j < lines.count, lines[j].hasPrefix("|") {
-                html += "<tr>" + cells(lines[j]).map { "<td>\($0)</td>" }.joined() + "</tr>"
-                j += 1
-            }
-            out.append(html + "</table>")
-            i = j
-            continue
-        }
-        if ln.hasPrefix("# ") { closeLists(); out.append("<h1>\(inline(String(ln.dropFirst(2))))</h1>") }
-        else if ln.hasPrefix("## ") { closeLists(); out.append("<h2>\(inline(String(ln.dropFirst(3))))</h2>") }
-        else if ln.hasPrefix("### ") { closeLists(); out.append("<h3>\(inline(String(ln.dropFirst(4))))</h3>") }
-        else if ln.hasPrefix("- [ ] ") || ln.hasPrefix("- [x] ") {
-            closeLists()
-            let checked = ln.hasPrefix("- [x] ") ? " checked" : ""
-            out.append("<div class=todo><input type=checkbox disabled\(checked)> \(inline(String(ln.dropFirst(6))))</div>")
-        }
-        else if ln.hasPrefix("- ") {
-            if inOl { out.append("</ol>"); inOl = false }
-            if !inUl { out.append("<ul>"); inUl = true }
-            out.append("<li>\(inline(String(ln.dropFirst(2))))</li>")
-        }
-        else if ln.range(of: #"^\d+\. "#, options: .regularExpression) != nil {
-            if inUl { out.append("</ul>"); inUl = false }
-            if !inOl { out.append("<ol>"); inOl = true }
-            let body = String(ln.drop(while: { $0 != " " }).dropFirst())
-            out.append("<li>\(inline(body))</li>")
-        }
-        else if ln.isEmpty { closeLists(); out.append("<div class=blank></div>") }
-        else { closeLists(); out.append("<p>\(inline(ln))</p>") }
-        i += 1
-    }
-    closeLists()
-    let css = """
-    :root { color-scheme: light dark; }
-    body { font: 14px/1.7 -apple-system, 'PingFang SC', sans-serif; margin: 0;
-           padding: 16px 20px; color: CanvasText; background: Canvas; max-width: 46em; }
-    h1 { font-size: 1.5em; margin: .6em 0 .3em; } h2 { font-size: 1.25em; margin: .6em 0 .3em; }
-    h3 { font-size: 1.1em; margin: .5em 0 .3em; }
-    p { margin: .2em 0; } ul, ol { margin: .2em 0; padding-left: 1.4em; }
-    .blank { height: .9em; } .todo { margin: .2em 0; }
-    table { border-collapse: collapse; margin: .5em 0; font-size: .95em; }
-    th, td { border: 1px solid rgba(127,127,127,.45); padding: 4px 9px; text-align: left; }
-    th { background: rgba(127,127,127,.12); }
-    code { font-family: ui-monospace, Menlo, monospace; font-size: .9em;
-           background: rgba(127,127,127,.15); border-radius: 4px; padding: 1px 5px; }
-    a { color: -apple-system-blue; }
-    """
-    return "<!doctype html><meta charset=utf-8><style>\(css)</style><body>\(out.joined())</body>"
+/// Run `python3 -m notesync <args>` in the engine checkout, feeding `input`
+/// on stdin. -> (stdout, exit status); status -1 if it could not start.
+func runEngine(_ args: [String], input: String? = nil) -> (out: String, status: Int32) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    p.arguments = ["-m", "notesync"] + args
+    p.currentDirectoryURL = URL(fileURLWithPath: projectDir)
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    p.environment = env
+    let outPipe = Pipe(), inPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = inPipe
+    do { try p.run() } catch { return ("", -1) }
+    if let input = input { inPipe.fileHandleForWriting.write(Data(input.utf8)) }
+    try? inPipe.fileHandleForWriting.close()
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
+}
+
+func escapeHTML(_ x: String) -> String {
+    x.replacingOccurrences(of: "&", with: "&amp;")
+     .replacingOccurrences(of: "<", with: "&lt;")
+     .replacingOccurrences(of: ">", with: "&gt;")
 }
 
 // MARK: - settings window
@@ -413,7 +356,11 @@ final class BrowserController: NSObject, NSTableViewDataSource, NSTableViewDeleg
         web.isHidden = !preview
         textScroll.isHidden = preview
         if preview {
-            web.loadHTMLString(mdToHTML(currentContent), baseURL: nil)
+            let r = runEngine(["preview"], input: currentContent)
+            let html = (r.status == 0 && !r.out.isEmpty) ? r.out :
+                "<!doctype html><meta charset=utf-8><body><p>预览失败（引擎目录：\(escapeHTML(projectDir))）</p>"
+                + "<pre>\(escapeHTML(currentContent))</pre>"
+            web.loadHTMLString(html, baseURL: nil)
         } else {
             text.string = currentContent
             text.scroll(.zero)
@@ -460,6 +407,64 @@ final class LogController: NSObject {
     }
 }
 
+// MARK: - format check window (notesync lint)
+
+final class LintController: NSObject {
+    let window = makeWindow("NoteSync 格式检查", 760, 460)
+    let text = NSTextView()
+
+    override init() {
+        super.init()
+        let v = window.contentView!
+        let fix = NSButton(title: "修正可自动修正的写法…", target: self, action: #selector(fixAll))
+        fix.frame = NSRect(x: 8, y: 424, width: 200, height: 28)
+        fix.autoresizingMask = [.maxXMargin, .minYMargin]
+        fix.bezelStyle = .rounded
+        v.addSubview(fix)
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(reload))
+        refresh.frame = NSRect(x: 680, y: 424, width: 70, height: 28)
+        refresh.autoresizingMask = [.minXMargin, .minYMargin]
+        refresh.bezelStyle = .rounded
+        v.addSubview(refresh)
+        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 760, height: 418))
+        sv.autoresizingMask = [.width, .height]
+        sv.hasVerticalScroller = true
+        text.frame = NSRect(origin: .zero, size: sv.contentSize)
+        text.isEditable = false
+        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.autoresizingMask = [.width]
+        text.textContainerInset = NSSize(width: 8, height: 8)
+        sv.documentView = text
+        v.addSubview(sv)
+    }
+
+    func show() {
+        reload()
+        present(window)
+    }
+
+    @objc func reload() {
+        let r = runEngine(["lint"])
+        let head = "按 NoteSync markdown 规范检查 SYNC 里的笔记（MARKDOWN_PROFILE.md）。\n"
+            + "fix = 写法不规范，可一键修正（只改写法、不改语义）；"
+            + "warn = 在笔记 App 里无法渲染，需要人判断。\n\n"
+        text.string = head + (r.status < 0 ? "(引擎启动失败：\(projectDir))" : r.out)
+        text.scroll(.zero)
+    }
+
+    @objc func fixAll() {
+        let alert = NSAlert()
+        alert.messageText = "把 fix 类写法改成规范写法？"
+        alert.informativeText = "会直接改写 SYNC 里的 md 文件（表格分隔行、* 列表、标题里的 ** 等），"
+            + "语义不变；改动随后同步到 Apple Notes 和 Evernote，git 里有历史可恢复。"
+        alert.addButton(withTitle: "修正")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = runEngine(["lint", "--fix"])
+        reload()
+    }
+}
+
 // MARK: - app delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -470,6 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let settings = SettingsController()
     let browser = BrowserController()
     let logView = LogController()
+    let lintView = LintController()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -499,6 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "立即同步", action: #selector(syncNow), keyEquivalent: "s")
         menu.addItem(withTitle: "笔记浏览器…", action: #selector(openBrowser), keyEquivalent: "b")
         menu.addItem(withTitle: "查看日志…", action: #selector(openLog), keyEquivalent: "l")
+        menu.addItem(withTitle: "格式检查…", action: #selector(openLint), keyEquivalent: "k")
         menu.addItem(withTitle: "打开 SYNC 文件夹", action: #selector(openSync), keyEquivalent: "o")
         menu.addItem(.separator())
         menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
@@ -580,6 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openBrowser() { browser.show() }
     @objc func openSettings() { settings.show() }
     @objc func openLog() { logView.show() }
+    @objc func openLint() { lintView.show() }
 
     @objc func openSync() {
         NSWorkspace.shared.open(URL(fileURLWithPath: syncDir))

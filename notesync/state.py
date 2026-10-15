@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS ep_map(
   native_id TEXT NOT NULL,
   base_hash TEXT,
   seen_rev  TEXT,
+  shadow    TEXT,
   PRIMARY KEY (uuid, ep)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ep_native ON ep_map(ep, native_id);
@@ -39,6 +40,10 @@ class DB:
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript(_SCHEMA)
+        cols = {r["name"] for r in self.con.execute("PRAGMA table_info(ep_map)")}
+        if "shadow" not in cols:  # v3: endpoint read-back when it is lossy
+            self.con.execute("ALTER TABLE ep_map ADD COLUMN shadow TEXT")
+            self.con.commit()
 
     # -- notes ------------------------------------------------------------
     def get_note(self, uid):
@@ -57,6 +62,10 @@ class DB:
                  base_hash=excluded.base_hash, base_commit=excluded.base_commit,
                  status='active'""",
             (uid, mapping, title, rel_path, base_hash, base_commit))
+        self.con.commit()
+
+    def set_base_hash(self, uid, base_hash):
+        self.con.execute("UPDATE notes SET base_hash=? WHERE uuid=?", (base_hash, uid))
         self.con.commit()
 
     def set_status(self, uid, status):
@@ -96,13 +105,22 @@ class DB:
                LIMIT 1""", (mapping, title, base_hash, ep)).fetchone()
         return r["uuid"] if r else None
 
-    def map_native(self, uid, ep, native_id, base_hash, seen_rev=None):
+    def map_native(self, uid, ep, native_id, base_hash, seen_rev=None, shadow=None):
+        """seen_rev: the endpoint's modification stamp when base_hash was
+        taken. shadow: the endpoint's flattened body when it differs from
+        the canonical text (a lossy copy) -- the merge base for its edits."""
         self.con.execute(
-            """INSERT INTO ep_map(uuid, ep, native_id, base_hash, seen_rev)
-               VALUES(?,?,?,?,?)
+            """INSERT INTO ep_map(uuid, ep, native_id, base_hash, seen_rev, shadow)
+               VALUES(?,?,?,?,?,?)
                ON CONFLICT(uuid, ep) DO UPDATE SET native_id=excluded.native_id,
-                 base_hash=excluded.base_hash, seen_rev=excluded.seen_rev""",
-            (uid, ep, native_id, base_hash, seen_rev))
+                 base_hash=excluded.base_hash, seen_rev=excluded.seen_rev,
+                 shadow=excluded.shadow""",
+            (uid, ep, native_id, base_hash, seen_rev, shadow))
+        self.con.commit()
+
+    def set_seen_rev(self, uid, ep, seen_rev):
+        self.con.execute("UPDATE ep_map SET seen_rev=? WHERE uuid=? AND ep=?",
+                         (seen_rev, uid, ep))
         self.con.commit()
 
     # -- misc -------------------------------------------------------------

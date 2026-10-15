@@ -1,6 +1,6 @@
 import unittest
 
-from notesync.normalize import chash, join_fm, normalize, sanitize_title, split_fm
+from notesync.normalize import chash, chash_v2, join_fm, normalize, sanitize_title, split_fm
 
 
 class TestNormalize(unittest.TestCase):
@@ -13,6 +13,14 @@ class TestNormalize(unittest.TestCase):
 
     def test_blank_lines_and_indent_preserved(self):
         self.assertEqual(normalize("a\n\n  code\n"), "a\n\n  code\n")
+
+    def test_leading_blank_lines_dropped(self):
+        self.assertEqual(normalize("\n\n# t\n\nx\n"), "# t\n\nx\n")
+
+    def test_legacy_hash(self):
+        import hashlib
+        self.assertEqual(chash_v2("\n# t\n"), hashlib.sha256(b"\n# t\n").hexdigest())
+        self.assertEqual(chash_v2("x\n"), chash("x\n"))
 
     def test_empty(self):
         self.assertEqual(normalize("   \n \n"), "")

@@ -1,4 +1,5 @@
-"""notesync CLI: init / status / sync / watch (DESIGN.md #10, #12).
+"""notesync CLI: init / status / sync / watch / rerender / audit / lint /
+profile / preview (DESIGN.md #10, #12).
 
 M1 scope: file endpoint only -- versioned canonical store with history.
 Note-app endpoints arrive in M2 (Evernote) and M3 (Apple Notes).
@@ -121,15 +122,28 @@ def cmd_watch(args):
 
 def cmd_rerender(args):
     """One-shot: re-push every synced note so endpoints pick up the current
-    rich rendering. Byte-level comparison lives in the adapters, so literal
-    copies get rewritten while already-rich ones are left alone; the md-level
-    hashes don't change, so no sync cycle is triggered."""
-    from .normalize import normalize, split_fm
-    from .state import DB
+    rendering, and re-baseline each endpoint from its read-back.
+
+    Safe only for notes that are in sync: a note whose file changed since
+    the last cycle, or whose endpoint copy was edited (modification stamp
+    moved), is skipped -- run `sync` first. Endpoint rows recorded before
+    stamps existed cannot be checked; they are pushed only with
+    --assume-synced, meant for right after a clean `sync` with the watcher
+    stopped. Holds the cycle lock, so it never races a running cycle."""
+    import fcntl
+    from .engine import _rev, _shadow
+    from .normalize import chash, chash_v2, normalize, split_fm
     cfg = load_cfg(args.config)
+    state = Path(cfg["state"])
+    lock = open(state / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("a sync cycle is running; try again in a moment")
     eps_by_mapping, closer = build_eps(cfg)
-    db = DB(Path(cfg["state"]) / "state.db")
+    db = DB(state / "state.db")
     store = Path(cfg["store"])
+    only = set(args.notes or [])
     try:
         for m in cfg["mappings"]:
             eps = eps_by_mapping.get(m["name"], {})
@@ -137,22 +151,118 @@ def cmd_rerender(args):
                 n = db.get_note(uid)
                 if not n or n["status"] != "active" or not n["rel_path"]:
                     continue
+                if only and not any(o in n["title"] for o in only):
+                    continue
                 path = store / n["rel_path"]
                 if not path.exists():
                     continue
-                _, body = split_fm(path.read_text(encoding="utf-8"))
-                body = normalize(body)
+                _, raw_body = split_fm(path.read_text(encoding="utf-8"))
+                body = normalize(raw_body)
+                if chash(body) != n["base_hash"]:
+                    if chash_v2(raw_body) != n["base_hash"]:
+                        print(f"[rerender-skip] {n['title']}: file changed since "
+                              "the last cycle (run sync first)")
+                        continue
+                    if not args.dry_run:  # same text, older normalization
+                        db.set_base_hash(uid, chash(body))
                 for name, row in db.ep_rows(uid).items():
                     if name not in eps:
                         continue
+                    ep = eps[name]
                     try:
-                        eps[name].update(row["native_id"], n["title"], body)
-                        print(f"[rerender] {n['title']} @ {name}")
+                        got = ep.fetch(row["native_id"])
+                        if got is None or got[1] is None:
+                            print(f"[rerender-skip] {n['title']} @ {name}: gone or frozen")
+                            continue
+                        cur_rev = _rev(got[2])
+                        if row["seen_rev"] is None and not args.assume_synced:
+                            print(f"[rerender-skip] {n['title']} @ {name}: no stamp "
+                                  "yet (after a clean sync: --assume-synced)")
+                            continue
+                        if row["seen_rev"] is not None and row["seen_rev"] != cur_rev \
+                                and chash(got[1]) != row["base_hash"]:
+                            print(f"[rerender-skip] {n['title']} @ {name}: edited in "
+                                  "the endpoint (run sync first)")
+                            continue
+                        if args.dry_run:
+                            print(f"[rerender] {n['title']} @ {name} (dry run)")
+                            continue
+                        ep.update(row["native_id"], n["title"], body)
+                        _, rb, mt = ep.read(row["native_id"])
+                        shadow = _shadow(rb, body)
+                        db.map_native(uid, name, row["native_id"], chash(rb),
+                                      _rev(mt), shadow)
+                        print(f"[rerender] {n['title']} @ {name}"
+                              + (" (read-back differs)" if shadow is not None else ""))
                     except Exception as e:  # dead mapping: leave to sync cycle
                         print(f"[rerender-skip] {n['title']} @ {name}: {e}")
     finally:
         db.close()
         closer()
+        lock.close()
+
+
+def cmd_audit(args):
+    from .audit import run
+    cfg = load_cfg(args.config)
+    which = tuple(args.only_ep.split(",")) if args.only_ep else ("apple", "en")
+    res = run(cfg, live=args.live, which=which, only=args.notes,
+              show_diff=args.diff, apple_folder=args.apple_folder,
+              en_notebook=args.en_notebook)
+    if any(v in ("LOSSY", "ERROR") for v in res.values()):
+        sys.exit(1)
+
+
+def cmd_lint(args):
+    """Lint markdown files against the NoteSync profile (--fix rewrites
+    lenient spellings to canonical ones)."""
+    from .lint import coalesce, lint_file
+    paths = [Path(p).expanduser() for p in args.paths]
+    if not paths:
+        from .audit import _files
+        files = _files(load_cfg(args.config))
+    else:
+        files = []
+        for p in paths:
+            files += sorted(p.glob("*.md")) if p.is_dir() else [p]
+        from .engine import IGNORED_FILES
+        files = [f for f in files if f.name not in IGNORED_FILES]
+    n_warn = n_fix = fixed = 0
+    for f in files:
+        findings, changed = lint_file(f, write=args.fix)
+        fixed += changed
+        shown = [x for x in findings if not (args.fix and x[1] == "fix")]
+        for a, b, sev, rule, msg in coalesce(shown):
+            if sev == "info" and not args.verbose:
+                continue
+            where = f"{a}" if a == b else f"{a}-{b}"
+            print(f"{f.name}:{where}: {sev}: [{rule}] {msg}")
+        n_warn += sum(1 for x in shown if x[1] == "warn")
+        n_fix += sum(1 for x in shown if x[1] == "fix")
+        if changed:
+            print(f"{f.name}: fixed")
+    print(f"{len(files)} file(s): {n_fix} fixable, {n_warn} warning(s)"
+          + (f", {fixed} file(s) rewritten" if args.fix else ""))
+    if n_fix or n_warn:
+        sys.exit(1)
+
+
+def cmd_preview(args):
+    """HTML preview of a note (a file, or stdin) -- used by the menu bar app."""
+    from .preview import page
+    text = (Path(args.file).read_text(encoding="utf-8") if args.file
+            else sys.stdin.read())
+    sys.stdout.write(page(text))
+
+
+def cmd_profile(args):
+    from .profiledoc import generate
+    text = generate()
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text, end="")
 
 
 def cmd_status(args):
@@ -179,10 +289,37 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in [("init", cmd_init), ("sync", cmd_sync),
                      ("watch", cmd_watch), ("status", cmd_status),
-                     ("rerender", cmd_rerender)]:
+                     ("rerender", cmd_rerender), ("audit", cmd_audit),
+                     ("lint", cmd_lint), ("profile", cmd_profile),
+                     ("preview", cmd_preview)]:
         p = sub.add_parser(name)
         p.set_defaults(fn=fn)
         if name == "watch":
             p.add_argument("--interval", type=int)
+        if name == "rerender":
+            p.add_argument("notes", nargs="*",
+                           help="only notes whose title contains one of these")
+            p.add_argument("--assume-synced", action="store_true",
+                           help="push rows that have no modification stamp yet")
+            p.add_argument("--dry-run", action="store_true")
+        if name == "audit":
+            p.add_argument("notes", nargs="*",
+                           help="only notes whose title contains one of these")
+            p.add_argument("--live", action="store_true",
+                           help="real round trips through the probe containers")
+            p.add_argument("--diff", action="store_true")
+            p.add_argument("--only-ep", help="apple, en, or apple,en")
+            p.add_argument("--apple-folder")
+            p.add_argument("--en-notebook")
+        if name == "lint":
+            p.add_argument("paths", nargs="*", help="files or folders "
+                           "(default: the synced store)")
+            p.add_argument("--fix", action="store_true",
+                           help="rewrite lenient spellings to canonical ones")
+            p.add_argument("-v", "--verbose", action="store_true")
+        if name == "preview":
+            p.add_argument("file", nargs="?", help="note file (default: stdin)")
+        if name == "profile":
+            p.add_argument("--out", help="write to this file instead of stdout")
     args = ap.parse_args(argv)
     args.fn(args)

@@ -11,7 +11,7 @@ import time
 import uuid as uuidlib
 from pathlib import Path
 
-from .merge import merge3
+from .merge import merge3, rebase
 from .normalize import chash, join_fm, normalize, sanitize_title, split_fm
 from .state import DB
 from .store import GitStore
@@ -19,6 +19,19 @@ from .store import GitStore
 
 def _new_uuid():
     return uuidlib.uuid4().hex
+
+
+def _rev(mtime):
+    """Endpoint modification stamp as stored in ep_map.seen_rev."""
+    return f"{float(mtime or 0):.3f}"
+
+
+def _shadow(body, canonical):
+    """What to remember of an endpoint copy: its flattened body when it
+    differs from the canonical text (the endpoint could not hold it
+    exactly), else None."""
+    body = normalize(body or "")
+    return body if body != canonical else None
 
 
 def sync_once(cfg, eps_by_mapping=None, log=lambda m: None):
@@ -180,10 +193,10 @@ def _sync_mapping(m, store_root, git, db, eps, conflicts, log):
                 if body is None:
                     skip_uid = True  # frozen mid-flight: hands off this cycle
                     break
-                present.append(dict(side=name, base=row["base_hash"],
-                                    nid=row["native_id"],
-                                    title=sanitize_title(title),
-                                    body=normalize(body), mtime=mtime))
+                ecur = dict(nid=row["native_id"], title=sanitize_title(title),
+                            body=normalize(body), mtime=mtime)
+                evers[name][uid] = ecur  # it exists: update it, never re-create
+                present.append(dict(side=name, base=row["base_hash"], **ecur))
         if skip_uid:
             continue
 
@@ -193,7 +206,43 @@ def _sync_mapping(m, store_root, git, db, eps, conflicts, log):
                 db.oplog(uid, "tombstone", "gone from every side")
             continue
 
-        changed = [s for s in present if chash(s["body"]) != (s["base"] or "")]
+        # -- which sides changed since base --------------------------------
+        # An endpoint counts as edited only if its content hash moved AND its
+        # modification stamp moved: an untouched note that we now read
+        # differently (flattener upgrade) is drift, not an edit -- treating it
+        # as an edit would push the old reading into the file.
+        changed, drifted = [], []
+        for s in present:
+            row = epmaps.get(s["side"]) if s["side"] != "file" else None
+            if chash(s["body"]) == (s["base"] or ""):
+                if row and row["seen_rev"] != _rev(s["mtime"]):
+                    db.set_seen_rev(uid, s["side"], _rev(s["mtime"]))
+                continue
+            if row and row["seen_rev"] and row["seen_rev"] == _rev(s["mtime"]):
+                drifted.append(s)
+                continue
+            if row and row["seen_rev"] is None:
+                # a row from before modification stamps: we cannot tell an
+                # edit from a new reading of an old copy, so the first sight
+                # under stamps adopts the endpoint as-is (no write-back)
+                drifted.append(s)
+                continue
+            if row and note and base:
+                # rebase the endpoint's edit onto the canonical text: only
+                # lines the user changed are taken from the endpoint -- lines
+                # it holds in a lossy form (shadow), or that merely lost
+                # whitespace on the way, keep their canonical form
+                src = row["shadow"] if row["shadow"] is not None else base
+                rebased, kept = rebase(src, s["body"], base)
+                rebased = normalize(rebased)
+                if rebased != s["body"]:
+                    db.oplog(uid, "guard", f"{s['side']} edit rebased onto canonical"
+                             + (" (edit inside a lossy stretch: endpoint text kept"
+                                " there)" if kept else ""))
+                    log(f"[guard] {note['title']} @ {s['side']}: edit rebased onto "
+                        "canonical")
+                    s["body"] = rebased
+            changed.append(s)
 
         if note and note["status"] in ("tombstone", "frozen") and present and not changed:
             changed = list(present)  # resurrect / unfreeze: re-sync unchanged content
@@ -219,6 +268,11 @@ def _sync_mapping(m, store_root, git, db, eps, conflicts, log):
         uncovered = [n for n in eps
                      if evers[n].get(uid) is None and n not in epmaps]
         if not changed and not retitled and not uncovered:
+            for s in drifted:  # re-baseline: remember how we read it now
+                db.map_native(uid, s["side"], s["nid"], chash(s["body"]),
+                              _rev(s["mtime"]), _shadow(s["body"], base))
+                db.oplog(uid, "drift", f"{s['side']} read differently, untouched")
+                log(f"[drift] {note['title'] if note else uid} @ {s['side']}")
             continue  # everything matches base; nothing to do
 
         # -- canonical body: fold 3-way merges, newer side favored --------
@@ -273,17 +327,22 @@ def _sync_mapping(m, store_root, git, db, eps, conflicts, log):
             try:
                 ecur = evers[name].get(uid)
                 if ecur and ecur["body"] == canonical and ecur["title"] == title:
-                    ep_updates[name] = (ecur["nid"], chash(canonical))
+                    ep_updates[name] = (ecur["nid"], chash(canonical),
+                                        _rev(ecur["mtime"]), None)
                     continue
                 if ecur:
                     nid = ep.update(ecur["nid"], title, canonical) or ecur["nid"]
                 else:
                     nid = ep.create(title, canonical)
-                _, body_rb, _ = ep.read(nid)
+                _, body_rb, mt_rb = ep.read(nid)
                 rb_hash = chash(body_rb)
-                if rb_hash != chash(canonical):
-                    db.oplog(uid, "fidelity", f"{name} round-trip differs")
-                ep_updates[name] = (nid, rb_hash)
+                shadow = _shadow(body_rb, canonical)
+                if shadow is not None:
+                    from .lint import canonical as canon_form
+                    kind = ("canonical spelling" if shadow == canon_form(canonical)
+                            else "lossy")
+                    db.oplog(uid, "fidelity", f"{name} round-trip differs ({kind})")
+                ep_updates[name] = (nid, rb_hash, _rev(mt_rb), shadow)
             except Exception as e:
                 ep_error = e
                 db.oplog(uid, "error", f"{name}: {e}")
@@ -296,13 +355,35 @@ def _sync_mapping(m, store_root, git, db, eps, conflicts, log):
         # per-note durable record (base_commit stamped after the cycle commit)
         db.upsert_note(uid, mname, title, rel_path, chash(canonical),
                        note["base_commit"] if note else None)
-        for ep_name, (e_nid, e_hash) in ep_updates.items():
-            db.map_native(uid, ep_name, e_nid, e_hash)
+        for ep_name, (e_nid, e_hash, e_rev, e_shadow) in ep_updates.items():
+            db.map_native(uid, ep_name, e_nid, e_hash, e_rev, e_shadow)
         touched.append(uid)
         db.oplog(uid, "sync", f"changed on {','.join(s['side'] for s in changed)}")
+        if any(s["side"] == "file" for s in changed):
+            _lint_warn(db, uid, title, canonical, log)
         log(f"[sync] {title} <- {','.join(s['side'] for s in changed)}")
 
     return touched
+
+
+def _lint_warn(db, uid, title, body, log):
+    """A file was written by hand or by an agent: say so if it strays from
+    the NoteSync markdown profile (content pasted from chat apps usually
+    does). Advisory only -- the file is never rewritten here."""
+    try:
+        from .lint import check
+        found = check(body, title)
+    except Exception as e:  # lint must never break a cycle
+        log(f"[lint error] {title}: {e}")
+        return
+    fixes = sum(1 for f in found if f[1] == "fix")
+    warns = sorted({f[2] for f in found if f[1] == "warn"})
+    if not fixes and not warns:
+        return
+    msg = (f"{fixes} fixable" if fixes else "") + \
+          (("; " if fixes else "") + "warn: " + ", ".join(warns) if warns else "")
+    db.oplog(uid, "lint", msg)
+    log(f"[lint] {title}: {msg} (notesync lint)")
 
 
 def _mirror(store_root, dst_root, log):

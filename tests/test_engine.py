@@ -201,3 +201,122 @@ class TestNewEndpoint(EngineHarness):
         self.assertEqual(epB.read("n.md")[1], "x\n")  # copy created on B
         n2 = sync_once(self.cfg, {"t": {"A": self.ep, "B": epB}})
         self.assertEqual(n2, 0)                       # and converges
+
+
+class LossyEndpoint(DirEndpoint):
+    """An endpoint that collapses whitespace on write -- Apple Notes before
+    whitespace pinning: runs of spaces become one, indentation is lost."""
+    def _squash(self, body):
+        import re
+        return "\n".join(re.sub(r" {2,}", " ", ln).lstrip(" ")
+                         for ln in body.split("\n"))
+
+    def create(self, title, body):
+        return super().create(title, self._squash(body))
+
+    def update(self, nid, title, body):
+        return super().update(nid, title, self._squash(body))
+
+
+class TestFidelityGuard(EngineHarness):
+    CODE = "intro\n```\n  indented  code\n    deeper\n```\nline six\n"
+
+    def test_lossy_endpoint_edit_does_not_flatten_file(self):
+        lossy = LossyEndpoint(self.eproot)
+        eps = {"t": {"A": lossy}}
+        self.write_file("g.md", self.CODE, keep_uuid=False)
+        sync_once(self.cfg, eps)
+        self.assertIn("indented code", lossy.read("g.md")[1])   # endpoint lossy
+        # the user edits one unrelated line in the endpoint's lossy copy
+        body = lossy.read("g.md")[1].replace("line six", "line six, edited")
+        (self.eproot / "g.md").write_text(body, encoding="utf-8")
+        self.bump(self.eproot / "g.md")
+        sync_once(self.cfg, eps)
+        self.assertEqual(self.fbody("g.md"), self.CODE.replace("line six", "line six, edited"))
+
+    def test_edit_inside_lossy_region_keeps_the_edit(self):
+        lossy = LossyEndpoint(self.eproot)
+        eps = {"t": {"A": lossy}}
+        self.write_file("h.md", self.CODE, keep_uuid=False)
+        sync_once(self.cfg, eps)
+        body = lossy.read("h.md")[1].replace("deeper", "deeper2")
+        (self.eproot / "h.md").write_text(body, encoding="utf-8")
+        self.bump(self.eproot / "h.md")
+        sync_once(self.cfg, eps)
+        self.assertIn("deeper2", self.fbody("h.md"))            # never lose it
+        self.assertIn("intro", self.fbody("h.md"))
+
+
+class TestWhitespaceGuard(EngineHarness):
+    def test_html_roundtrip_edit_keeps_indentation(self):
+        body = "```\n  x  = 1\n```\ntail\n"
+        self.write_file("w.md", body, keep_uuid=False)
+        self.sync()
+        # a tool rewrote the note: whitespace collapsed, one word changed
+        self.write_ep("w.md", "```\nx = 1\n```\ntail!\n")
+        self.sync()
+        self.assertEqual(self.fbody("w.md"), "```\n  x  = 1\n```\ntail!\n")
+
+
+class DriftEndpoint(DirEndpoint):
+    """Reads through a swappable view: models a flattener upgrade that reads
+    an untouched endpoint note differently."""
+    view = None
+
+    def read(self, nid):
+        t, b, m = super().read(nid)
+        return t, (self.view(b) if self.view else b), m
+
+
+class TestDrift(EngineHarness):
+    def test_reader_change_is_not_an_edit(self):
+        ep = DriftEndpoint(self.eproot)
+        eps = {"t": {"A": ep}}
+        self.write_file("d.md", "a  b\nkeep\n", keep_uuid=False)
+        sync_once(self.cfg, eps)
+        ep.view = lambda b: b.replace("a  b", "a b")   # reader "upgrade"
+        self.assertEqual(sync_once(self.cfg, eps), 0)
+        self.assertEqual(self.fbody("d.md"), "a  b\nkeep\n")      # file intact
+        self.assertEqual(sync_once(self.cfg, eps), 0)
+        # a real edit after the drift is still picked up, relative to it
+        (self.eproot / "d.md").write_text("a  b\nkeep, edited\n", encoding="utf-8")
+        self.bump(self.eproot / "d.md")
+        sync_once(self.cfg, eps)
+        self.assertEqual(self.fbody("d.md"), "a  b\nkeep, edited\n")
+
+
+class TestLegacyRows(EngineHarness):
+    def test_row_without_stamp_is_adopted_not_written_back(self):
+        from notesync.state import DB
+        ep = DriftEndpoint(self.eproot)
+        eps = {"t": {"A": ep}}
+        self.write_file("l.md", "a  b\n", keep_uuid=False)
+        sync_once(self.cfg, eps)
+        db = DB(self.state / "state.db")
+        db.con.execute("UPDATE ep_map SET seen_rev=NULL")   # pre-v3 row
+        db.con.commit()
+        db.close()
+        ep.view = lambda b: b.replace("a  b", "a b")          # new reading
+        self.assertEqual(sync_once(self.cfg, eps), 0)
+        self.assertEqual(self.fbody("l.md"), "a  b\n")
+
+
+class HiddenEndpoint(DirEndpoint):
+    """list() misses notes (search index lag) that fetch() still finds."""
+    hidden = set()
+
+    def list(self):
+        return [n for n in super().list() if n not in self.hidden]
+
+
+class TestListLag(EngineHarness):
+    def test_file_change_while_hidden_updates_not_duplicates(self):
+        ep = HiddenEndpoint(self.eproot)
+        eps = {"t": {"A": ep}}
+        self.write_file("s.md", "v1\n", keep_uuid=False)
+        sync_once(self.cfg, eps)
+        ep.hidden = {"s.md"}
+        self.write_file("s.md", "v2\n")
+        sync_once(self.cfg, eps)
+        self.assertEqual(sorted(DirEndpoint.list(ep)), ["s.md"])   # no copy
+        self.assertEqual(ep.read("s.md")[1], "v2\n")

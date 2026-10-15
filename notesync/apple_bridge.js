@@ -8,7 +8,13 @@ function run(argv) {
 }
 
 function getFolder(app, accName, folderName) {
-  return app.accounts.byName(accName).folders.byName(folderName);
+  // byName silently picks one of several same-named folders, and not always
+  // the same one: a flip would look like every note was deleted. Refuse.
+  const fs = app.accounts.byName(accName).folders.whose({ name: folderName })();
+  if (fs.length !== 1) {
+    throw new Error("folder \"" + folderName + "\" is not unique (" + fs.length + " found)");
+  }
+  return fs[0];
 }
 
 function main(app, cmd, a) {

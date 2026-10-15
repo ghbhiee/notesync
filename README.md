@@ -34,17 +34,21 @@ The pain lives in the intersection. Something written in one system is invisible
 
 The canonical store is a folder of markdown files. The engine polls all three ends, flattens everything to markdown, and compares content hashes at the markdown layer — endpoint byte-level noise (Apple's `<br>` jitter, entity rewriting, Evernote's re-serialization) cannot cause churn. The last agreed state of every note lives in a git commit; diff3 merges use it as the common ancestor.
 
-The core invariant of the format layer: **`flatten(render(md)) == md`** for every element a profile declares. Anything an endpoint cannot round-trip losslessly stays literal text — ugly is acceptable, silent data loss is not.
+The core invariant of the format layer: **`flatten(render(md)) == md`** for every element a profile declares. Anything an endpoint cannot round-trip losslessly stays literal text — ugly is acceptable, silent data loss is not. Which construct renders where is declared once, in a capability registry (`notesync/capabilities.py`); the renderer, the linter, the test matrix and [MARKDOWN_PROFILE.md](MARKDOWN_PROFILE.md) all derive from it.
 
 | markdown | Evernote | Apple Notes |
 |---|---|---|
-| `#` / `##` headings | h1 / h2 | rendered (stored as bold + 24/18px) |
-| `###` | h3 | rendered (encoded as 18px + italic — `<h3>` degrades to bare `<b>`, and Apple strips any font size below 18px) |
-| `**bold**` / `*italic*` | rendered | rendered |
-| `- ` lists | ul | ul |
-| pipe tables (canonical form) | rendered | rendered as native table objects |
-| ordered lists, links, checklists | links render; rest literal | literal (Apple drops `href` and list types) |
+| `#` `##` `###` headings | h1–h3 | rendered (bold 24px / 18px; h3 as a bold underlined line) |
+| `**bold**` `*italic*`, inline code | rendered | rendered (italic and inline code containing CJK stay literal) |
+| fenced code blocks | code block, verbatim | monospaced paragraphs, verbatim |
+| `- ` and `1. ` lists, nested | rendered | rendered (lists resumed after a paragraph stay literal) |
+| pipe tables | rendered | native table objects |
+| quotes, `---` | rendered | literal |
+| links | rendered | literal (Apple drops `href`) |
+| indentation / runs of spaces | kept (written as `&nbsp;`) | kept |
 | images / attachments | note frozen | note frozen |
+
+Endpoint copies that still differ from the file (a lossy copy) are remembered, and an edit made there is rebased onto the canonical text line by line, so untouched lines — code indentation above all — can never be flattened into the file. `notesync audit --live` round-trips every note through probe containers to prove fidelity; `notesync lint` checks a note against the profile.
 
 Hard-won endpoint facts are documented in [DEVLOG.zh.md](DEVLOG.zh.md) (Chinese): Evernote's search index lies in both directions (deletion needs primary-key confirmation), Apple's note `name` is a truncated first line, notes in Recently Deleted are still readable by id, and more.
 
@@ -60,10 +64,11 @@ cp -R NoteSyncBar.app /Applications/ && open /Applications/NoteSyncBar.app
 
 Requirements: macOS 13+, Xcode command line tools, Node (Evernote is reached through the official MCP server via `npx mcp-remote`; complete the Evernote OAuth once in any MCP client — credentials are shared in `~/.mcp-auth`). On first launch, allow the app access to Documents and iCloud Drive. See `config.example.json` (`engine_dir` should point at your clone); the menu bar app has a settings panel too.
 
-The engine is plain-stdlib Python; the app is a single-file AppKit program. CLI: `python3 -m notesync init|sync|status|watch|rerender`.
+The engine is plain-stdlib Python; the app is a single-file AppKit program. CLI: `python3 -m notesync init|sync|status|watch|rerender|audit|lint|profile`.
 
 ## Documents
 
+- [MARKDOWN_PROFILE.md](MARKDOWN_PROFILE.md) — the markdown subset that round-trips; hand it to any agent that writes notes (generated from the code)
 - [DESIGN.md](DESIGN.md) — full architecture & design decisions (Chinese)
 - [DEVLOG.zh.md](DEVLOG.zh.md) — development log, calibration experiments, battle-tested endpoint quirks (Chinese)
 

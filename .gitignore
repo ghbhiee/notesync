@@ -4,3 +4,5 @@ macapp/NoteSyncBar
 macapp/NoteSyncBar.app/
 config.json
 .DS_Store
+HANDOFF.md
+handoff/
